@@ -1,0 +1,396 @@
+function [neural_data, time_cell_info] = NWB_calcSelective_SB_Load1ImageSpecificmay11_Null( ...
+        nwbAll, all_units, bin_width_analysis, preprocess, useSpikeInPeak, nullShuffle, varargin)
+%BUILDNEURALDATA_LOAD1IMAGESPECIFIC_STRICT  Detect load-1 image-specific time cells.
+%
+% INPUTS
+%   nwbAll              – {1×S} NWB session objects
+%   all_units           – struct array with fields: subject_id, unit_id,
+%                         session_count, spike_times (and optionally electrodes)
+%   bin_width_analysis  – scalar (s), e.g. 0.100 for 100 ms bins
+%   preprocess          – logical; output firing rates are smoothed if true
+%   useSpikeInPeak      – logical; apply spike-in-peak consistency gates if true
+%   nullShuffle         – logical; if true, build a null by per-trial circular shifts
+%                         within the maintenance window and scrambling load-1 image labels
+%
+% PARAMS (name/value, optional; defaults shown)
+%   'Alpha'                 , 0.05
+%   'NumPermutations'       , 1000
+%   'MaintainDuration'      , 2.5           % seconds
+%   'MinTrialsPerImage'     , 7
+%   'SpikeWinHalfWidth'     , 2             % half-width (bins) around peak
+%   'FracTrialsRequired'    , 0.80          % strengthened: 80% trials with ≥1 spike in peak window
+%   'MinTrialsRequired'     , 5             % minimum absolute trial count in peak window
+%   'UseControlWindow'      , true          % require inside > control by a margin
+%   'ControlWinOffsetBins'  , 6             % control window center offset (bins) from peak
+%   'ControlDeltaTrials'    , 2             % inside must exceed outside by ≥ this many trials
+%   'RngSeed'               , 55
+%
+% OUTPUTS
+%   neural_data     – struct array (one per detected time cell)
+%   time_cell_info  – numeric matrix [patient, unit, preferredImg, peakBin]
+%
+% Notes:
+% * Detection uses smoothed+z-scored per-trial traces to compute frAvg and p-values.
+% * Spike-in-peak uses RAW counts within the ±SpikeWinHalfWidth window around peak.
+% * Null mode (nullShuffle=true) leaves output building untouched; it only perturbs
+%   detection by shifting spikes inside load-1 maintenance windows and shuffling labels.
+% -------------------------------------------------------------------------
+
+if nargin < 6 || isempty(nullShuffle), nullShuffle = false; end
+
+% ---------------------------- Parameters ---------------------------------
+p = inputParser;
+p.addParameter('Alpha',               0.05);
+p.addParameter('NumPermutations',     1000);
+p.addParameter('MaintainDuration',    2.5);
+p.addParameter('MinTrialsPerImage',   7);
+p.addParameter('SpikeWinHalfWidth',   0);
+p.addParameter('FracTrialsRequired',  0.7);
+p.addParameter('MinTrialsRequired',   5);
+p.addParameter('UseControlWindow',    false);
+p.addParameter('ControlWinOffsetBins',6);
+p.addParameter('ControlDeltaTrials',  2);
+p.addParameter('RngSeed',             32);
+p.addParameter('ImageSelectivityMin', 0.4);   % z-units
+p.parse(varargin{:});
+prm = p.Results;
+rng(prm.RngSeed);
+
+alphaLim         = prm.Alpha;
+num_permutations = prm.NumPermutations;
+total_bins       = round(prm.MaintainDuration / bin_width_analysis);
+min_trial_count  = prm.MinTrialsPerImage;
+
+% Smoothing kernel used during detection (assumes user-defined GaussianKernal)
+gKer = GaussianKernal(3, 1.5);
+
+spikeWinHalfWidth = prm.SpikeWinHalfWidth;
+
+num_units = numel(all_units);
+
+% -------------------------- Time-cell search -----------------------------
+time_cell_info = [];
+
+for iU = 1:num_units
+    SU = all_units(iU);
+
+    fprintf('Processing unit %d/%d  [Subject %d  Unit %d]\n', ...
+            iU, num_units, SU.subject_id, SU.unit_id);
+
+    % ---- Fetch trial metadata -----------------------------------------
+    sess = nwbAll{SU.session_count};
+    enc1 = sess.intervals_trials.vectordata.get('loadsEnc1_PicIDs').data.load();
+    enc2 = sess.intervals_trials.vectordata.get('loadsEnc2_PicIDs').data.load();
+    enc3 = sess.intervals_trials.vectordata.get('loadsEnc3_PicIDs').data.load();
+    tsM  = sess.intervals_trials.vectordata.get('timestamps_Maintenance').data.load();
+
+    % Keep single-load trials (enc1 only)
+    singleMask = (enc1 > 0) & (enc2 == 0) & (enc3 == 0);
+    if ~any(singleMask),  continue;  end
+
+    imgIDs   = enc1(singleMask);               % load-1 image IDs (subset)
+    tStruct  = struct('tsMaint', num2cell(tsM(singleMask)));
+    spikeTimes_det = SU.spike_times;           % detection spikes (possibly shuffled)
+
+    % ---- Null shuffle (optional) --------------------------------------
+    if nullShuffle
+        T = total_bins * bin_width_analysis;   % maintenance duration (s)
+        tMaint = tsM(singleMask);              % maintenance starts for load-1 trials
+
+        % Per-trial circular shifts within maintenance window (bin-aligned)
+        for tr = 1:numel(tMaint)
+            t0 = tMaint(tr);
+            inWin = (spikeTimes_det >= t0) & (spikeTimes_det < t0 + T);
+            rel = spikeTimes_det(inWin) - t0;
+            shift = (randi(total_bins) - 1) * bin_width_analysis;
+            rel = mod(rel + shift, T);
+            spikeTimes_det(inWin) = rel + t0;
+        end
+
+        % Scramble the image labels across load-1 trials
+        imgIDs = imgIDs(randperm(numel(imgIDs)));
+    end
+
+    uImgs    = unique(imgIDs);
+    nImgs    = numel(uImgs);
+
+    is_locked  = false(1,nImgs);
+    peakAmp    = -inf(1,nImgs);
+    peakBin    = zeros(1,nImgs);
+    frAvg_store = cell(1,nImgs);   % NEW: hold per-image frAvg
+
+
+    % ---- Loop over images ---------------------------------------------
+    for k = 1:nImgs
+        thisImg     = uImgs(k);
+        trialMask   = (imgIDs == thisImg);
+        trials_here = tStruct(trialMask);
+        nTr         = numel(trials_here);
+
+        if nTr < min_trial_count,  continue;  end
+
+        % ---- Detection matrices (z for stats, raw for spike checks)
+        [frAvg, spkMatZ, spkMatRaw] = binGaussZscore(spikeTimes_det, trials_here, ...
+                                        bin_width_analysis, total_bins, gKer); %#ok<ASGLU>
+
+        % ---- Peak for this image (used by gates & global step)
+        [pk, pkBin] = max(frAvg);
+        frAvg_store{k} = frAvg;        % NEW: cache frAvg for selectivity step
+        peakAmp(k)  = pk;
+        peakBin(k)  = pkBin;
+
+        % ---- Coarse sanity: ≥3 trials have any raw spike in maintenance
+        trialsWithAnySpike = sum(spkMatRaw, 2) > 0;
+        if sum(trialsWithAnySpike) < 3
+            continue
+        end
+
+        % ---- Permutation significance on max(frAvg)
+        pval = permTest_timeLocked(frAvg, spikeTimes_det, trials_here, ...
+                                   bin_width_analysis, total_bins, ...
+                                   num_permutations, gKer);
+        if pval >= alphaLim
+            continue
+        end
+
+        % ---- Spike-in-peak consistency (strengthened)
+        if useSpikeInPeak
+            % Inside (peak) window
+            winL = max(1, pkBin - spikeWinHalfWidth);
+            winR = min(total_bins, pkBin + spikeWinHalfWidth);
+            win  = winL:winR;
+
+            trialsInside = any(spkMatRaw(:,win) > 0, 2);  % raw counts
+
+            needTrials = max(prm.MinTrialsRequired, ceil(prm.FracTrialsRequired * nTr));
+            if sum(trialsInside) < needTrials
+                continue
+            end
+
+            % Optional: control window comparison
+            if prm.UseControlWindow
+                % center control window offset toward the global center
+                ctrlCenter = pkBin + sign((total_bins/2) - pkBin) * prm.ControlWinOffsetBins;
+                ctrlCenter = max(1, min(total_bins, ctrlCenter));
+                ctrlL = max(1, ctrlCenter - spikeWinHalfWidth);
+                ctrlR = min(total_bins, ctrlCenter + spikeWinHalfWidth);
+                ctrl  = ctrlL:ctrlR;
+
+                trialsOutside = any(spkMatRaw(:,ctrl) > 0, 2);
+
+                if sum(trialsInside) < sum(trialsOutside) + prm.ControlDeltaTrials
+                    continue
+                end
+            end
+        end
+
+        % ---- Image passes all within-image gates ----------------------
+        is_locked(k) = true;
+    end
+
+    % ---- Global gate: exactly one significant image + image selectivity
+    sigImgs = find(is_locked);
+    if isscalar(sigImgs)
+        prefIdx = sigImgs;
+    
+        % --- Compute peak-window mean for the preferred image
+        pkSig   = peakBin(prefIdx);
+        if pkSig <= 0 || isempty(frAvg_store{prefIdx})
+            continue
+        end
+        winSigL = max(1, pkSig - spikeWinHalfWidth);
+        winSigR = min(total_bins, pkSig + spikeWinHalfWidth);
+        sigMean = mean(frAvg_store{prefIdx}(winSigL:winSigR));
+    
+        % --- Compute peak-window means for all other images (that were evaluable)
+        otherIdx   = setdiff(1:nImgs, prefIdx);
+        otherMeans = nan(1, numel(otherIdx));
+        for ii = 1:numel(otherIdx)
+            jj   = otherIdx(ii);
+            pkB  = peakBin(jj);
+            if pkB <= 0 || isempty(frAvg_store{jj})
+                continue
+            end
+            winL = max(1, pkB - spikeWinHalfWidth);
+            winR = min(total_bins, pkB + spikeWinHalfWidth);
+            otherMeans(ii) = mean(frAvg_store{jj}(winL:winR));
+        end
+        otherMeans = otherMeans(~isnan(otherMeans));
+        if isempty(otherMeans)
+            % If no other image had evaluable frAvg/peak, treat as failing selectivity
+            continue
+        end
+    
+        % --- Image selectivity score (z-units)
+        imgSelectivity = sigMean - mean(otherMeans);
+    
+        if imgSelectivity > prm.ImageSelectivityMin
+            % Passes selectivity: accept the unit
+            time_cell_info = [time_cell_info; ...
+                SU.subject_id, SU.unit_id, uImgs(prefIdx), peakBin(prefIdx)];
+            % (Optional) store selectivity if you want it later:
+            % time_cell_info = [time_cell_info; SU.subject_id, SU.unit_id, uImgs(prefIdx), ...
+            %                   peakBin(prefIdx), imgSelectivity];
+        else
+            % Fails selectivity: reject the unit
+            % continue
+        end
+    end
+
+end
+
+fprintf('Detected %d load-1 image-specific time cells.\n', size(time_cell_info,1));
+
+% -------------------- Build neural_data struct --------------------------
+neural_data = struct('patient_id',{},'unit_id',{},'preferred_image',{}, ...
+                     'time_field',{},'firing_rates',{},'trial_correctness',{}, ...
+                     'brain_region',{},'trial_imageIDs',{},'trial_load',{}, ...
+                     'trial_RT',{},'trial_probe_in_out',{});
+
+for r = 1:size(time_cell_info,1)
+    pid   = time_cell_info(r,1);
+    uid   = time_cell_info(r,2);
+    pref  = time_cell_info(r,3);
+    tfbin = time_cell_info(r,4);
+
+    SUidx = find([all_units.subject_id]==pid & [all_units.unit_id]==uid, 1);
+    if isempty(SUidx)
+        warning('Unit %d/%d missing after filtering.', pid, uid);
+        continue
+    end
+    SU = all_units(SUidx);
+
+    % ---- Pull trial-level info ---------------------------------------
+    sess = nwbAll{SU.session_count};
+    tsM  = sess.intervals_trials.vectordata.get('timestamps_Maintenance').data.load();
+    resp = sess.intervals_trials.vectordata.get('response_accuracy').data.load();
+    ID1  = sess.intervals_trials.vectordata.get('loadsEnc1_PicIDs').data.load();
+    ID2  = sess.intervals_trials.vectordata.get('loadsEnc2_PicIDs').data.load();
+    ID3  = sess.intervals_trials.vectordata.get('loadsEnc3_PicIDs').data.load();
+
+    correctVec = double(resp == 1);
+    trialImgs  = [ID1(:), ID2(:), ID3(:)];
+    trialLoad  = sum(trialImgs ~= 0, 2);
+
+    % ---- Bin spikes for output (session-wide) -------------------------
+    nT  = numel(tsM);
+    spkM = zeros(nT, total_bins);
+    for tr = 1:nT
+        for b = 1:total_bins
+            t0 = tsM(tr) + (b-1)*bin_width_analysis;
+            t1 = t0 + bin_width_analysis;
+            spkM(tr,b) = sum(SU.spike_times >= t0 & SU.spike_times < t1);
+        end
+    end
+
+    % ---- Optional preprocessing for output (smoothed, no z-score) ----
+    if preprocess
+        for tr = 1:nT
+            spkM(tr,:) = conv(spkM(tr,:), gKer, 'same');
+        end
+    end
+
+    % ---- Brain region (if available) ---------------------------------
+    try
+        regStr = sess.general_extracellular_ephys_electrodes ...
+                     .vectordata.get('location').data.load(SU.electrodes);
+        brainRegion = regStr{:};
+    catch
+        brainRegion = 'unknown';
+    end
+
+    % ---- Reaction time & probe in/out --------------------------------
+    tsProbe = sess.intervals_trials.vectordata.get('timestamps_Probe').data.load();
+    tsResp  = sess.intervals_trials.vectordata.get('timestamps_Response').data.load();
+    trialRT = tsResp - tsProbe;
+
+    vd = sess.intervals_trials.vectordata;
+    try
+        probe_in_out = vd.get('probe_in_out').data.load();
+    catch
+        probe_in_out = nan(size(tsM));
+    end
+
+    % ---- Assemble struct ---------------------------------------------
+    nd.patient_id         = pid;
+    nd.unit_id            = uid;
+    nd.preferred_image    = pref;
+    nd.time_field         = tfbin;
+    nd.firing_rates       = spkM;
+    nd.trial_correctness  = correctVec(:);
+    nd.brain_region       = brainRegion;
+    nd.trial_imageIDs     = trialImgs;
+    nd.trial_load         = trialLoad;
+    nd.trial_RT           = trialRT(:);
+    nd.trial_probe_in_out = probe_in_out(:);
+
+    neural_data(end+1) = nd; %#ok<AGROW>
+end
+
+fprintf('Created neural_data for %d time cells (preprocess=%d).\n', ...
+        numel(neural_data), preprocess);
+
+end  % --------------------------- END MAIN -------------------------------
+
+
+%% ===================== Helper sub-functions ============================
+
+% Bin raw counts + make z-scored smoothed matrices (detection only)
+function [frAvg, spkMatZ, spkMatRaw] = binGaussZscore(spikeTimes, trials, binW, totalBins, gKer)
+    nT = numel(trials);
+    spkMatRaw = zeros(nT,totalBins);
+    for k = 1:nT
+        t0 = trials(k).tsMaint;
+        for b = 1:totalBins
+            bs = t0 + (b-1)*binW; be = bs + binW;
+            spkMatRaw(k,b) = sum(spikeTimes >= bs & spikeTimes < be);
+        end
+    end
+    spkMatZ = zeros(size(spkMatRaw));
+    for k = 1:nT
+        spkMatZ(k,:) = zscore_safe(conv(spkMatRaw(k,:), gKer, 'same'));
+    end
+    frAvg = mean(spkMatZ,1);
+end
+
+
+function Z = zscore_safe(X)
+    mu = mean(X,2);
+    sd = std(X,0,2);
+    sd(sd==0) = 1;           % avoid NaNs; leaves the row as zeros after centering
+    Z = (X - mu) ./ sd;
+end
+
+
+% Permutation test on max(frAvg)
+function p = permTest_timeLocked(frAvg, spikeTimes, trials, binW, totalBins, nPerm, gKer)
+    obs  = max(frAvg);
+    null = zeros(nPerm,1);
+
+    for pIdx = 1:nPerm
+        permSpk = [];
+        for k = 1:numel(trials)
+            tRef = trials(k).tsMaint;
+            T    = totalBins * binW;
+            trS  = spikeTimes(spikeTimes >= tRef & spikeTimes < tRef+T) - tRef;
+            shift  = (randi(totalBins)-1)*binW;      % bin-aligned circular shift
+            permTr = mod(trS + shift, T);
+            permSpk = [permSpk; permTr + tRef]; %#ok<AGROW>
+        end
+
+        permMat = zeros(numel(trials), totalBins);
+        for k = 1:numel(trials)
+            tRef = trials(k).tsMaint;
+            for b = 1:totalBins
+                bs = tRef + (b-1)*binW;
+                be = bs + binW;
+                permMat(k,b) = sum(permSpk >= bs & permSpk < be);
+            end
+        end
+        for k = 1:size(permMat,1)
+            permMat(k,:) = zscore(conv(permMat(k,:), gKer, 'same'));
+        end
+        null(pIdx) = max(mean(permMat,1));
+    end
+    p = mean(null >= obs);
+end

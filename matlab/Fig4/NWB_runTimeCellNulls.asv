@@ -1,0 +1,255 @@
+
+function [sig_cells, areasSternberg, time_cell_info] = ...
+    NWB_calcSelective_SB_Load1ImageSpecificmay11_fast(nwbAll, all_units, bin_width_analysis, useSpikeInPeak)
+% FAST load-1 image-specific time-cell detector.
+% Returns only:
+%   - sig_cells.time_cells : N×1 logical (unit is image-specific time cell)
+%   - areasSternberg       : N×1 cellstr (brain region per unit)
+%   - time_cell_info       : [patient_id, unit_id, preferredImg, peakBin]
+%
+% Optimizations:
+%   • cache session metadata
+%   • bin spikes once per unit (single-load trials) → (T×B) counts
+%   • within-image permutations via circular shift in BIN space
+%   • vectorized smoothing (conv2) + row-wise z-score
+%
+% Inputs:
+%   nwbAll, all_units  (fields: subject_id, unit_id, session_count, spike_times, electrodes)
+%   bin_width_analysis (e.g., 0.1)
+%   useSpikeInPeak     (logical) enforce spike-in-peak consistency
+%
+% NOTE: No neural_data is created; this is meant to be called by an
+%       empirical runner that tallies region counts from areas + sig flag.
+
+rng(42);                   % deterministic permutations inside one call
+alphaLim         = 0.05;
+num_permutations = 1000;
+total_bins       = round(2.5 / bin_width_analysis);   % 25 for 100ms bins
+min_trial_count  = 7;
+spikeWinHalfWidth= 2;      % ±2 bins for spike-in-peak
+gKer             = GaussianKernal(3, 1.5);
+
+N      = numel(all_units);
+edges  = linspace(0, total_bins*bin_width_analysis, total_bins+1);
+
+% Outputs
+sig_cells.time_cells = false(N,1);
+areasSternberg       = cell(N,1);
+time_cell_info       = [];
+
+% Per-session cache
+sessCache = containers.Map('KeyType','double','ValueType','any');
+
+fprintf('--- FAST load-1 image-specific time-cell detection (no neural_data) ---\n');
+
+for iU = 1:N
+    SU       = all_units(iU);
+    sess_id  = SU.session_count;
+    subj_id  = SU.subject_id;
+    unit_id  = SU.unit_id;
+
+    % -------- cache session fields once --------
+    if ~isKey(sessCache, sess_id)
+        vd = nwbAll{sess_id}.intervals_trials.vectordata;
+        S.tsM  = vd.get('timestamps_Maintenance').data.load(); S.tsM = S.tsM(:);
+        S.enc1 = vd.get('loadsEnc1_PicIDs').data.load();       S.enc1 = S.enc1(:);
+        S.enc2 = vd.get('loadsEnc2_PicIDs').data.load();       S.enc2 = S.enc2(:);
+        S.enc3 = vd.get('loadsEnc3_PicIDs').data.load();       S.enc3 = S.enc3(:);
+        % brain locations for this session
+        try
+            loc = nwbAll{sess_id}.general_extracellular_ephys_electrodes. ...
+                  vectordata.get('location').data.load();
+            if iscell(loc), S.locations = loc; else, S.locations = cellstr(loc); end
+        catch
+            S.locations = {};
+        end
+        sessCache(sess_id) = S;
+    end
+    S = sessCache(sess_id);
+
+    % Brain region for this unit (best-effort)
+    try
+        areasSternberg{iU} = S.locations{all_units(iU).electrodes};
+    catch
+        areasSternberg{iU} = 'unknown';
+    end
+
+    % -------- select load-1 trials --------
+    singleMask = (S.enc1 > 0) & (S.enc2 == 0) & (S.enc3 == 0);
+    if ~any(singleMask), continue; end
+
+    tsM    = S.tsM(singleMask);
+    imgIDs = S.enc1(singleMask);
+    [grp, uImgs] = findgroups(imgIDs);
+    nImgs  = numel(uImgs);
+    T      = numel(tsM);
+
+    % -------- bin all single-load trials ONCE (T×B) --------
+    spkM_counts = zeros(T, total_bins, 'single');
+    for t = 1:T
+        rel = SU.spike_times(SU.spike_times>=tsM(t) & ...
+                             SU.spike_times< tsM(t)+total_bins*bin_width_analysis) - tsM(t);
+        spkM_counts(t,:) = histcounts(rel, edges);
+    end
+
+    % -------- image loop --------
+    peakAmp  = -inf(1,nImgs);
+    peakBin  = zeros(1,nImgs);
+    is_sign  = false(1,nImgs);
+
+    for k = 1:nImgs
+        idx_k = find(grp == k);
+        if numel(idx_k) < min_trial_count, continue; end
+
+        M  = spkM_counts(idx_k,:);                % (nTr×B) raw counts
+        sm = conv2(M, gKer(:).', 'same');         % smooth all trials
+        mu = mean(sm,2); sg = std(sm,0,2); sg(sg==0)=1;
+        zM = (sm - mu) ./ sg;                     % row-wise z-score
+        frAvg = mean(zM, 1);
+
+        [pk, pkBin_k] = max(frAvg);
+        peakAmp(k) = pk; peakBin(k) = pkBin_k;
+
+        % require some spikes at all
+        if sum(sum(M,2) > 0) < 3, continue; end
+
+        % Permutation test: circular shift in BIN space
+        p = permTest_fast(frAvg, M, num_permutations, gKer);
+        if p >= alphaLim, continue; end
+
+        % Spike-in-peak consistency (on RAW counts, not z)
+        if useSpikeInPeak
+            win = max(1, pkBin_k-spikeWinHalfWidth):min(total_bins, pkBin_k+spikeWinHalfWidth);
+            hasSpike = any(M(:,win) > 0, 2);
+            if sum(hasSpike) < max(4, ceil(0.7*numel(idx_k)))
+                continue;
+            end
+        end
+
+        is_sign(k) = true;
+    end
+
+    % Global peak dominance gate
+    [~, prefIdx] = max(peakAmp);
+    if is_sign(prefIdx) && all(peakAmp(prefIdx) > peakAmp(setdiff(1:nImgs,prefIdx)))
+        sig_cells.time_cells(iU) = true;
+        time_cell_info = [time_cell_info; subj_id, unit_id, uImgs(prefIdx), peakBin(prefIdx)]; %#ok<AGROW>
+    end
+end
+
+fprintf('Detected %d load-1 image-specific time cells.\n', sum(sig_cells.time_cells));
+end
+
+% ----------------------- Helpers ----------------------------------------
+function p = permTest_fast(frAvg_obs, spkM_counts, nPerm, gKer)
+    % frAvg_obs: 1×B (observed), spkM_counts: T×B raw counts (for this image)
+    obs = max(frAvg_obs);
+    [T,B] = size(spkM_counts);
+    null_max = zeros(nPerm,1);
+    for pIdx = 1:nPerm
+        shifts = randi(B,T,1)-1;
+        M = spkM_counts;
+        for t = 1:T
+            s = shifts(t); if s~=0, M(t,:) = circshift(M(t,:), [0 s]); end
+        end
+        sm = conv2(M, gKer(:).','same');
+        mu = mean(sm,2); sg = std(sm,0,2); sg(sg==0)=1;
+        zM = (sm - mu) ./ sg;
+        null_max(pIdx) = max(mean(zM,1));
+    end
+    p = mean(null_max >= obs);
+end
+
+
+% ===================== Core detector (per unit) ==========================
+function isTC = detect_timecell_for_unit(spkCounts_TxB, groups, gKer, total_bins, ...
+                                         alphaLim, num_permutations, spikeWinHalfWidth, min_trial_count)
+% spkCounts_TxB   : raw counts (T × B), single or double
+% groups          : cell array of trial index vectors (absolute indices into rows of spkCounts_TxB)
+% Returns true if the unit passes within-image gates AND global dominance.
+
+    K = numel(groups);
+    if K == 0
+        isTC = false; return;
+    end
+
+    is_locked = false(1,K);
+    peakAmp   = -inf(1,K);
+    peakBin   = zeros(1,K);
+
+    for k = 1:K
+        idx = groups{k};
+        nTr = numel(idx);
+        if nTr < min_trial_count, continue; end
+
+        M = double(spkCounts_TxB(idx,:));           % (nTr × B) raw counts
+
+        % Smooth + row-wise zscore
+        sm = conv2(M, gKer(:).', 'same');
+        mu = mean(sm, 2); sg = std(sm, 0, 2); sg(sg==0) = 1;
+        zM = (sm - mu) ./ sg;
+        frAvg = mean(zM, 1);
+
+        [pk, pkBin] = max(frAvg);
+        peakAmp(k)  = pk;
+        peakBin(k)  = pkBin;
+
+        % Quick trials-with-spike check on RAW counts in ±2 bins around pkBin
+        win = max(1, pkBin - spikeWinHalfWidth) : min(total_bins, pkBin + spikeWinHalfWidth);
+        trialsWithSpike = any(M(:,win) > 0, 2);
+        if sum(trialsWithSpike) < 3
+            continue
+        end
+
+        % Permutation test in BIN space on this image's rows
+        p = permTest_fast(frAvg, M, gKer, num_permutations);
+        if p >= alphaLim
+            continue
+        end
+
+        % Spike-in-peak consistency (>= max(4, 70% of trials))
+        trialsWithSpike = any(M(:,win) > 0, 2);
+        if sum(trialsWithSpike) < max(4, ceil(0.7 * nTr))
+            continue
+        end
+
+        is_locked(k) = true;
+    end
+
+    % Global dominance: best image must be significant and strictly higher
+    [~, prefIdx] = max(peakAmp);
+    if is_locked(prefIdx)
+        others = setdiff(1:K, prefIdx);
+        isTC = all(peakAmp(prefIdx) > peakAmp(others));
+    else
+        isTC = false;
+    end
+end
+
+% ============== Permutation test (bin-space circshift) ===================
+function p = permTest_fast(frAvg_obs, M_counts, gKer, nPerm)
+    obs = max(frAvg_obs);
+    [T,B] = size(M_counts);
+    null_max = zeros(nPerm,1);
+    for pIdx = 1:nPerm
+        shifts = randi(B, T, 1) - 1;
+        M = M_counts;
+        for t = 1:T
+            s = shifts(t);
+            if s ~= 0
+                M(t,:) = circshift(M(t,:), [0, s]);
+            end
+        end
+        sm = conv2(M, gKer(:).', 'same');
+        mu = mean(sm, 2); sg = std(sm, 0, 2); sg(sg==0) = 1;
+        zM = (sm - mu) ./ sg;
+        null_max(pIdx) = max(mean(zM, 1));
+    end
+    p = mean(null_max >= obs);
+end
+
+% ======================= Region canonicalization =========================
+function canon = canon_region(str_in)
+    s = lower(strtrim(str_in));
+    canon = regexprep(s, '_(left|right)$', '');
+end

@@ -1,0 +1,187 @@
+function plotsingleunit_RTspeed(nwbAll, all_units, ...
+                                neural_data_file, use_correct, ...
+                                use_zscore, pctThresh)
+% Modified version to compute fast/slow trial split per load level.
+
+if nargin < 5 || isempty(use_correct), use_correct = true;  end
+if nargin < 6 || isempty(use_zscore),  use_zscore  = false; end
+if nargin < 7 || isempty(pctThresh),   pctThresh   = 25;    end
+
+load(neural_data_file,'neural_data');
+
+bin_size   = 0.05;
+bins       = 0:bin_size:2.5;
+n_bins     = numel(bins)-1;
+
+gauss_kernel = GaussianKernal(0.5 / bin_size, 2);
+
+for ndx = 31:40
+
+    pid      = neural_data(ndx).patient_id;
+    uid      = neural_data(ndx).unit_id;
+    tf_bin   = double(neural_data(ndx).time_field);
+    rt_vec   = neural_data(ndx).trial_RT;                % [T x 1]
+    corr_vec = neural_data(ndx).trial_correctness == 1;  % logical
+    is_valid = ~isnan(rt_vec);
+    load_vec = neural_data(ndx).trial_load;              % [T x 1]
+
+    if nnz(is_valid) < 10
+        warning('Unit %d/%d skipped (insufficient RT data).',pid,uid);
+        continue;
+    end
+
+    %% <<< New: Load-wise fast/slow classification
+    fast_mask = false(size(rt_vec));
+    slow_mask = false(size(rt_vec));
+    unique_loads = unique(load_vec(is_valid));
+
+    for l = unique_loads(:)'  % iterate through each load condition
+        in_load = load_vec == l & is_valid;
+        rt_load = rt_vec(in_load);
+        if numel(rt_load) < 5, continue; end  % skip if too few trials
+
+        p_low  = prctile(rt_load, pctThresh);
+        p_high = prctile(rt_load, 100 - pctThresh);
+
+        fast_mask = fast_mask | (in_load & rt_vec <= p_low);
+        slow_mask = slow_mask | (in_load & rt_vec >= p_high);
+    end
+
+    %% <<< Optional correctness filtering (after RT group assignment)
+    if use_correct
+        fast_mask = fast_mask & corr_vec;
+        slow_mask = slow_mask & corr_vec;
+    end
+
+    fast_idx = find(fast_mask);
+    slow_idx = find(slow_mask);
+
+    if isempty(fast_idx) || isempty(slow_idx)
+        warning('Unit %d/%d skipped (no trials in one RT bracket).',pid,uid);
+        continue;
+    end
+
+    %% ------------------------------------------------------ SU handle
+    m = ([all_units.subject_id]==pid & [all_units.unit_id]==uid);
+    if ~any(m), warning('Unit %d/%d not found',pid,uid); continue; end
+    SU = all_units(m);
+
+    tsMaint  = nwbAll{SU.session_count}.intervals_trials ...
+                      .vectordata.get('timestamps_Maintenance') ...
+                      .data.load();
+    spk      = SU.spike_times;
+    n_trials = numel(tsMaint);
+
+    %% ------------------------------------------------------ overall PSTH
+    fr_all = zeros(n_trials, n_bins);
+    for t = 1:n_trials
+        s = spk(spk>=tsMaint(t) & spk<tsMaint(t)+2.5) - tsMaint(t);
+        fr_all(t,:) = histcounts(s,bins)/bin_size;
+    end
+    mean_fr_all = mean(fr_all,1);
+
+    baseline    = mean(mean_fr_all);
+    thr         = baseline + 0.5*std(mean_fr_all);
+
+    centre_t    = (tf_bin-0.5)*0.1;
+    [~,centre]  = min(abs(bins(1:end-1)-centre_t));
+    left  = centre;
+    while left>1      && mean_fr_all(left) >= thr, left  = left-1; end
+    right = centre;
+    while right<n_bins && mean_fr_all(right)>= thr, right = right+1; end
+
+    t_start = bins(left);
+    t_end   = bins(right);
+
+    %% ------------------------------------------------ PSTH for RT groups
+    fr_fast = zeros(numel(fast_idx), n_bins);
+    fr_slow = zeros(numel(slow_idx), n_bins);
+
+    for ii = 1:numel(fast_idx)
+        tr = fast_idx(ii);
+        s  = spk(spk>=tsMaint(tr) & spk<tsMaint(tr)+2.5) - tsMaint(tr);
+        fr_fast(ii,:) = histcounts(s,bins)/bin_size;
+    end
+    for jj = 1:numel(slow_idx)
+        tr = slow_idx(jj);
+        s  = spk(spk>=tsMaint(tr) & spk<tsMaint(tr)+2.5) - tsMaint(tr);
+        fr_slow(jj,:) = histcounts(s,bins)/bin_size;
+    end
+
+    if use_zscore
+        fr_fast = zscore_trials(fr_fast);
+        fr_slow = zscore_trials(fr_slow);
+        y_label = 'Z‑score';
+    else
+        y_label = 'Rate (spk/s)';
+    end
+
+    m_fast   = mean(fr_fast,1);
+    m_slow   = mean(fr_slow,1);
+    sem_fast = std(fr_fast,0,1)/sqrt(size(fr_fast,1));
+    sem_slow = std(fr_slow,0,1)/sqrt(size(fr_slow,1));
+
+    sm_fast  = conv(m_fast, gauss_kernel,'same');
+    sm_slow  = conv(m_slow, gauss_kernel,'same');
+    sm_sem_f = conv(sem_fast,gauss_kernel,'same');
+    sm_sem_s = conv(sem_slow,gauss_kernel,'same');
+
+    %% ============================================================= PLOTS
+    figure('Units','pixels','Position',[100 100 400 648],'Color','w');
+
+    subplot(2,1,1); hold on
+    n_plot = numel(fast_idx) + numel(slow_idx);
+
+    fill([t_start t_start t_end t_end],[0 n_plot+1 n_plot+1 0], ...
+         [0.6 0.8 1],'EdgeColor','none','FaceAlpha',0.4);
+
+    for ii = 1:numel(fast_idx)
+        tr = fast_idx(ii);
+        s  = spk(spk>=tsMaint(tr) & spk<tsMaint(tr)+2.5) - tsMaint(tr);
+        scatter(s, ii*ones(size(s)), 9,'b','filled');
+    end
+
+    for jj = 1:numel(slow_idx)
+        tr = slow_idx(jj);
+        s  = spk(spk>=tsMaint(tr) & spk<tsMaint(tr)+2.5) - tsMaint(tr);
+        scatter(s, (numel(fast_idx)+jj)*ones(size(s)), 9,'r','filled');
+    end
+    xlim([0 2.5]); ylim([0 n_plot+1]);
+    xlabel('Time (s)'); ylabel('Trial');
+    ttl = sprintf('Patient %d  |  Unit %d  |  Load-wise RT split @ %d%%', ...
+                  pid, uid, pctThresh);
+    if use_correct
+        ttl = [ttl '  |  correct‑only'];
+    end
+    title(ttl,'Interpreter','none');
+    set(gca,'FontSize',12);
+
+    subplot(2,1,2); hold on
+    yl = [0, max([sm_fast+sm_sem_f, sm_slow+sm_sem_s])+1];
+    patch([t_start t_start t_end t_end],[yl(1) yl(2) yl(2) yl(1)], ...
+          [0.6 0.8 1],'EdgeColor','none','FaceAlpha',0.2);
+
+    plot(bins(1:end-1), sm_fast,'b-','LineWidth',2);
+    xshade = [bins(1:end-1) fliplr(bins(1:end-1))];
+    yshade = [sm_fast+sm_sem_f fliplr(sm_fast-sm_sem_f)];
+    fill(xshade,yshade,'b','EdgeColor','none','FaceAlpha',0.25);
+
+    plot(bins(1:end-1), sm_slow,'r-','LineWidth',2);
+    yshade = [sm_slow+sm_sem_s fliplr(sm_slow-sm_sem_s)];
+    fill(xshade,yshade,'r','EdgeColor','none','FaceAlpha',0.25);
+
+    legend({sprintf('Fast (≤ %d%% each load)',pctThresh), ...
+            sprintf('Slow (≥ %d%% each load)',100-pctThresh)}, ...
+            'Location','best');
+    xlim([0 2.5]); ylim(yl);
+    xlabel('Time (s)'); ylabel(y_label);
+    set(gca,'FontSize',12);
+end
+end
+
+function zmat = zscore_trials(mat)
+mu  = mean(mat,2);
+sig = std(mat,0,2);
+sig(sig==0) = 1;
+zmat = (mat - mu) ./ sig;
+end

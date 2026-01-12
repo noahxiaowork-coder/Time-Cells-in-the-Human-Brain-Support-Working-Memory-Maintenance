@@ -1,0 +1,284 @@
+function stats = venn_neural_overlap(matFiles, varargin)
+% VENN_NEURAL_OVERLAP  Show overlap of (patient_id, unit_id) across neural_data .mat files.
+%
+%   stats = venn_neural_overlap(matFiles, 'Labels', labels, 'Method', method, 'Plot', true, ...
+%                               'VennFaceAlpha', 0.12, 'VennOutlineOnly', false)
+%
+%   INPUTS
+%     matFiles : cellstr or string array of .mat paths; each must contain variable 'neural_data'
+%                which is a struct array with fields patient_id and unit_id (as in your saver).
+%
+%   NAME-VALUE PAIRS
+%     'Labels'          : cellstr of names for each file (default = file basenames)
+%     'Method'          : 'auto' (default), 'venn', or 'upset'
+%                         - 'auto': uses Venn for <=3 sets, UpSet for >3 sets
+%     'Plot'            : logical (default true) whether to plot
+%     'VennFaceAlpha'   : scalar in [0,1], transparency for Venn fills (default 0.12). Set 0 for outlines only.
+%     'VennOutlineOnly' : logical, if true forces outline-only circles (FaceAlpha=0) (default false)
+%
+%   OUTPUT
+%     stats : struct with fields
+%         .labels
+%         .sizes              (1×N) elements per set
+%         .pairwise           table of pairwise overlaps
+%         .triple             table of triple overlaps (only when N>=3)
+%         .all_intersections  containers.Map where keys are binary masks like '11010'
+%         .region_counts      table of exclusive-region counts (N<=3) or mask table (N>=4)
+%
+%   REQUIREMENTS
+%     - For Venn: Bioinformatics Toolbox (venn)
+%     - For UpSet: MATLAB R2018b+ (upsetplot)
+%
+%   Example
+%     files = {'setA.mat','setB.mat','setC.mat'};
+%     stats = venn_neural_overlap(files, 'Labels', {'PipelineA','PipelineB','PipelineC'});
+%
+%   Xiaoxuan-compatible: considers ONLY patient_id & unit_id.
+
+% ---- parse inputs
+if isstring(matFiles), matFiles = cellstr(matFiles); end
+validateattributes(matFiles, {'cell'}, {'vector','nonempty'});
+p = inputParser;
+p.addParameter('Labels', {}, @(c) iscellstr(c) || isstring(c));
+p.addParameter('Method', 'auto', @(s) ischar(s) || isstring(s));
+p.addParameter('Plot', true, @(b) islogical(b) && isscalar(b));
+p.addParameter('VennFaceAlpha', 0.12, @(x) isnumeric(x) && isscalar(x) && x>=0 && x<=1);
+p.addParameter('VennOutlineOnly', false, @(b) islogical(b) && isscalar(b));
+p.parse(varargin{:});
+labels = p.Results.Labels;
+method = lower(string(p.Results.Method));
+doPlot = p.Results.Plot;
+vennFaceAlpha = p.Results.VennFaceAlpha;
+vennOutlineOnly = p.Results.VennOutlineOnly;
+
+% ---- default labels from basenames
+if isempty(labels)
+    labels = cellfun(@(f) strip(string(f), filesep), matFiles, 'uni', 0);
+    labels = cellfun(@(s) string(regexprep(s, '^.*[\\/]', '')), labels, 'uni', 0);
+end
+labels = cellstr(string(labels));
+N = numel(matFiles);
+if numel(labels) ~= N
+    error('Number of Labels (%d) must match number of files (%d).', numel(labels), N);
+end
+
+% ---- load each file, extract unique (patient_id, unit_id) pairs
+sets = cell(1,N);
+for i = 1:N
+    f = matFiles{i};
+    if ~isfile(f), error('File not found: %s', f); end
+    S = load(f);
+    if ~isfield(S, 'neural_data')
+        error('File %s does not contain variable ''neural_data''.', f);
+    end
+    nd = S.neural_data;
+    mustHave = all(isfield(nd, {'patient_id','unit_id'}));
+    if ~mustHave
+        error('In %s, neural_data must have fields patient_id and unit_id.', f);
+    end
+    % collect pairs and deduplicate within set
+    pid = vertcat(nd.patient_id);
+    uid = vertcat(nd.unit_id);
+    pairs = [pid(:) uid(:)];
+    sets{i} = unique(pairs, 'rows');  % rows: [patient_id unit_id]
+end
+
+% ---- sizes
+sizes = cellfun(@(A) size(A,1), sets);
+
+% ---- helper for row-wise intersection
+interRows = @(A,B) intersect(A,B,'rows','stable');
+
+% ---- compute intersections map (bitmask -> count), useful for UpSet + stats
+% build universe of all unique pairs
+allPairs = unique(vertcat(sets{:}), 'rows', 'stable');
+M = false(size(allPairs,1), N);
+for i = 1:N
+    M(:,i) = ismember(allPairs, sets{i}, 'rows');
+end
+% count each unique membership pattern
+[patterns, ~, idxPat] = unique(M, 'rows', 'stable');
+countsPat = accumarray(idxPat, 1);
+maskStr = arrayfun(@(r) char('0' + patterns(r,:)), (1:size(patterns,1))', 'uni', 0);
+all_intersections = containers.Map(maskStr, num2cell(countsPat));
+
+% ---- build human-readable pairwise / triple tables
+% pairwise
+pw_rows = {};
+for i = 1:N
+    for j = i+1:N
+        nAB = size(interRows(sets{i}, sets{j}), 1);
+        pw_rows(end+1,:) = {labels{i}, labels{j}, nAB}; %#ok<AGROW>
+    end
+end
+pairwiseTbl = cell2table(pw_rows, 'VariableNames', {'A','B','Overlap'});
+
+% triple
+tripleTbl = table;
+if N >= 3
+    tr_rows = {};
+    for i = 1:N
+        for j = i+1:N
+            for k = j+1:N
+                Aij = interRows(sets{i}, sets{j});
+                nABC = size(interRows(Aij, sets{k}), 1);
+                tr_rows(end+1,:) = {labels{i}, labels{j}, labels{k}, nABC}; %#ok<AGROW>
+            end
+        end
+    end
+    if ~isempty(tr_rows)
+        tripleTbl = cell2table(tr_rows, 'VariableNames', {'A','B','C','Overlap'});
+    end
+end
+
+% ---- region-by-region counts (for N<=3) + generic mask table
+regionTbl = table;
+if N == 2
+    n12   = size(interRows(sets{1}, sets{2}), 1);
+    only1 = sizes(1) - n12;
+    only2 = sizes(2) - n12;
+    both  = n12;
+
+    fprintf('\n[REGIONS — %s vs %s]\n', labels{1}, labels{2});
+    fprintf('  only %-12s : %d\n', labels{1}, only1);
+    fprintf('  only %-12s : %d\n', labels{2}, only2);
+    fprintf('  %-17s : %d\n', 'intersection', both);
+
+    regionTbl = cell2table( ...
+        {labels{1}, only1; labels{2}, only2; [labels{1} '+' labels{2}], both}, ...
+        'VariableNames', {'Region','Count'});
+
+elseif N == 3
+    n12  = size(interRows(sets{1}, sets{2}), 1);
+    n13  = size(interRows(sets{1}, sets{3}), 1);
+    n23  = size(interRows(sets{2}, sets{3}), 1);
+    n123 = size(interRows(interRows(sets{1},sets{2}), sets{3}), 1);
+
+    % pairwise-only regions
+    ab_only = n12 - n123;
+    ac_only = n13 - n123;
+    bc_only = n23 - n123;
+
+    % single-only regions
+    a_only = sizes(1) - ab_only - ac_only - n123;
+    b_only = sizes(2) - ab_only - bc_only - n123;
+    c_only = sizes(3) - ac_only - bc_only - n123;
+
+    fprintf('\n[REGIONS — %s, %s, %s]\n', labels{1}, labels{2}, labels{3});
+    fprintf('  only %-12s : %d\n', labels{1}, a_only);
+    fprintf('  only %-12s : %d\n', labels{2}, b_only);
+    fprintf('  only %-12s : %d\n', labels{3}, c_only);
+    fprintf('  %-17s : %d\n', [labels{1} '+' labels{2} ' (only)'], ab_only);
+    fprintf('  %-17s : %d\n', [labels{1} '+' labels{3} ' (only)'], ac_only);
+    fprintf('  %-17s : %d\n', [labels{2} '+' labels{3} ' (only)'], bc_only);
+    fprintf('  %-17s : %d\n', [labels{1} '+' labels{2} '+' labels{3}], n123);
+
+    regionTbl = cell2table( ...
+        {['only ' labels{1}], a_only; ['only ' labels{2}], b_only; ['only ' labels{3}], c_only; ...
+         [labels{1} '+' labels{2} ' (only)'], ab_only; ...
+         [labels{1} '+' labels{3} ' (only)'], ac_only; ...
+         [labels{2} '+' labels{3} ' (only)'], bc_only; ...
+         [labels{1} '+' labels{2} '+' labels{3}], n123}, ...
+        'VariableNames', {'Region','Count'});
+else
+    % For N>=4 there is no Venn; provide a readable mask table from all_intersections
+    keys = all_intersections.keys;
+    vals = cellfun(@(k) all_intersections(k), keys);
+    % Sort by count desc
+    [vals, ord] = sort(vals, 'descend');
+    keys = keys(ord);
+    % Build label for each mask (e.g., 1010 -> labels{1}, labels{3})
+    maskToNames = @(mask) strjoin(labels(mask=='1'), '+');
+    names = cellfun(maskToNames, keys, 'uni', 0);
+    regionTbl = table(keys(:), string(names(:)), vals(:), ...
+        'VariableNames', {'Mask','Sets','Count'});
+
+    fprintf('\n[REGIONS — UpSet masks]\n');
+    for r = 1:numel(keys)
+        fprintf('  %s : %s  -> %d\n', keys{r}, names{r}, vals(r));
+    end
+end
+
+% ---- decide plotting method
+if method == "auto"
+    useVenn = N <= 3;
+elseif method == "venn"
+    useVenn = true;
+elseif method == "upset"
+    useVenn = false;
+else
+    error('Unknown Method: %s', method);
+end
+
+if doPlot
+    if useVenn
+        figure('Name','Neural Unit Overlap (Venn)');
+        switch N
+            case 2
+                nAB = size(interRows(sets{1}, sets{2}), 1);
+                try
+                    [H,~] = venn([sizes(1) sizes(2)], nAB);
+                end
+            case 3
+                n12  = size(interRows(sets{1}, sets{2}), 1);
+                n13  = size(interRows(sets{1}, sets{3}), 1);
+                n23  = size(interRows(sets{2}, sets{3}), 1);
+                n123 = size(interRows(interRows(sets{1},sets{2}), sets{3}), 1);
+                try
+                    [H,~] = venn([sizes(1) sizes(2) sizes(3)], [n12 n13 n23 n123]);
+                catch ME
+                    warning('venn() failed: %s. Falling back to UpSet.', ME.message);
+                    useVenn = false;
+                end
+            otherwise
+                warning('Venn supports up to 3 sets. Falling back to UpSet.');
+                useVenn = false;
+        end
+
+        if useVenn
+            % Styling for legibility of manual black numbers
+            if vennOutlineOnly
+                faceAlphaUse = 0.0;
+            else
+                faceAlphaUse = vennFaceAlpha;
+            end
+            if exist('H','var') && ~isempty(H)
+                cmap = lines(numel(H)); % distinct but not too vivid
+                for ii = 1:numel(H)
+                    try
+                        set(H(ii), 'FaceColor', cmap(ii,:), ...
+                                   'FaceAlpha', faceAlphaUse, ...
+                                   'EdgeColor', [0.25 0.25 0.25], ...
+                                   'LineWidth', 1.25);
+                    catch
+                        % some MATLAB versions return handles that are not patch; guard softly
+                    end
+                end
+            end
+            axis equal off
+            title('Overlap of (patient\_id, unit\_id)');
+            legend(labels, 'Location','bestoutside');
+        end
+    end
+
+    if ~useVenn
+        % Build a table of logical membership columns for upsetplot
+        T = array2table(M, 'VariableNames', matlab.lang.makeValidName(labels));
+        figure('Name','Neural Unit Overlap (UpSet)');
+        try
+            upsetplot(T);
+            title('Overlap of (patient\_id, unit\_id)');
+        end
+    end
+end
+
+% ---- package output
+stats = struct();
+stats.labels = labels;
+stats.sizes = sizes;
+stats.pairwise = pairwiseTbl;
+stats.triple = tripleTbl;
+stats.all_intersections = all_intersections;
+stats.region_counts = regionTbl;
+
+end
