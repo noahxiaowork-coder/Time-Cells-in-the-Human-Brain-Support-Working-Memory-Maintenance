@@ -53,7 +53,7 @@ The script automatically runs `generateCore()` if the NWB API is not yet initial
   * `NWB_importFromFolder`
   * `NWB_SB_extractUnits`
   * `Find_cue_cells`
-  * `NWB_calcSelective_SB`
+  * `Find_time_cells`
   * `create_neural_data`
 
 must be present in MATLAB path.
@@ -229,7 +229,7 @@ Extracts spike times and waveforms.
 
 #### 3. Time Cell Identification
 
-* `NWB_calcSelective_SB`
+* `Find_time_cells`
 * Identifies time cells 
 
 #### 4. Neural Data Construction
