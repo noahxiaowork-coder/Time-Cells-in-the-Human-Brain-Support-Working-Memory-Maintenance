@@ -92,27 +92,3 @@ switch taskFlag
     otherwise
         error('Task flag not properly specified')
 end
-
-%%
-
-%plot_concept_ratecurve() 
-% plot_concept_ratecurve(nwbAll_sb, all_units_sb, 'Nov27_Nov18.mat', 0.1)
-% neural_data = create_concept_neural_data(nwbAll_sb, all_units_sb, paramsSB, 0.1, true);
-%plot_LIS_integratedHM(nwbAll_sb, all_units_sb, 'Nov27_Nov18.mat', 0.1, 2)
-% plot_single_cell_cue_specific(nwbAll_sb, all_units_sb, neural_data, 0.1, 16, 10, false);
-
-
-% plot_single_cell_cue_specific(nwbAll_sb, all_units_sb, neural_data, ...
-%                                   0.1, subject_id, unit_id, ...
-%                                   use_zscore, show_multi_nonpref)
-
-
-% Load neural_data first before calling plot_rt_heatmaps_subgroup
-% data = load('3sig15_data.mat', 'neural_data');
-% neural_data = data.neural_data;
-% plot_rt_heatmaps_subgroup(neural_data, 0.1, true);
-
-% showTimeCellAverages_ByRegionLoadIntegrated(nwbAll_sb, all_units_sb,'3sig15_data.mat', 0.1, true)
-% 
-% [neural_data, time_cell_info, unit_stats] = Find_cue_cells( ...
-%     nwbAll_sb, all_units_sb, 0.100, false);
